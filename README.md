@@ -22,10 +22,12 @@ outputs/
 ```
 
 ## Requirements
+```text
 Python 3.10+
 A Runpod Serverless endpoint
 A valid Runpod API key
 A valid workflow request template in input.json
+```
 
 ## Installation
 
@@ -61,3 +63,8 @@ Important
 
 Do not commit .env.
 Rotate your API key if it was ever exposed.
+
+## Run
+```text
+python main.py
+```
