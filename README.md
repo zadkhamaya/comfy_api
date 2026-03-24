@@ -58,9 +58,8 @@ Create a .env file in the project root:
 ```text
 RUNPOD_API_KEY=your_runpod_api_key
 RUNPOD_ENDPOINT_ID=your_endpoint_id
-Important
 ```
-
+### Important
 Do not commit .env.
 Rotate your API key if it was ever exposed.
 
