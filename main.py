@@ -24,11 +24,12 @@ HEADERS = {
 }
 
 INPUT_LIST_FILE = "list_inputs.txt"
-WORKFLOW_TEMPLATE_FILE = "example_input.json"
-OUTPUT_DIR = "outputs"
+WORKFLOW_TEMPLATE_FILE = "input.json"
+OUTPUT_DIR = Path("outputs")
+DEBUG_DIR = OUTPUT_DIR / "debug"
 
 IMAGES_PER_INPUT = 1
-MAX_CONCURRENT_REQUESTS = 5
+MAX_CONCURRENT_REQUESTS = 1
 POLL_INTERVAL_SECONDS = 3
 REQUEST_TIMEOUT_SECONDS = 60
 STATUS_TIMEOUT_SECONDS = 60
@@ -38,6 +39,11 @@ MAX_WAIT_SECONDS = 1800
 def log(message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}")
+
+
+def ensure_dirs() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: str) -> dict:
@@ -50,19 +56,25 @@ def load_prompts(path: str) -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
-def set_prompt(payload: dict, prompt: str) -> dict:
-    data = copy.deepcopy(payload)
-    data["input"]["workflow"]["1"]["inputs"]["text"] = prompt
-    return data
-
-
 def sanitize_filename(text: str, max_len: int = 80) -> str:
     cleaned = "".join(c if c.isalnum() or c in (" ", "_", "-") else "_" for c in text)
     cleaned = "_".join(cleaned.split())
     return cleaned[:max_len] or "output"
 
 
-def submit_job(payload: dict) -> str:
+def save_json_debug(name: str, data: dict) -> None:
+    ensure_dirs()
+    path = DEBUG_DIR / f"{name}.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def set_prompt(payload: dict, prompt: str) -> dict:
+    data = copy.deepcopy(payload)
+    data["input"]["workflow"]["1"]["inputs"]["text"] = prompt
+    return data
+
+
+def submit_job(payload: dict, prompt: str) -> str:
     response = requests.post(
         RUN_URL,
         headers=HEADERS,
@@ -71,6 +83,9 @@ def submit_job(payload: dict) -> str:
     )
     response.raise_for_status()
     result = response.json()
+
+    debug_name = f"submit_{sanitize_filename(prompt)}_{int(time.time())}"
+    save_json_debug(debug_name, result)
 
     if "id" not in result:
         raise RuntimeError(f"Unexpected submit response: {json.dumps(result, indent=2)}")
@@ -88,14 +103,21 @@ def get_job_status(job_id: str) -> dict:
     return response.json()
 
 
-def wait_for_completion(job_id: str) -> dict:
+def wait_for_completion(job_id: str, prompt: str) -> dict:
     start_time = time.time()
+    last_status = None
 
     while True:
         result = get_job_status(job_id)
         status = result.get("status", "UNKNOWN")
 
+        if status != last_status:
+            log(f"Job {job_id} status: {status}")
+            last_status = status
+
         if status in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}:
+            debug_name = f"final_{sanitize_filename(prompt)}_{job_id}"
+            save_json_debug(debug_name, result)
             return result
 
         if time.time() - start_time > MAX_WAIT_SECONDS:
@@ -109,28 +131,31 @@ def save_base64_image(image_b64: str, output_path: Path) -> None:
     output_path.write_bytes(image_bytes)
 
 
-def extract_images(result: dict) -> list[str]:
+def extract_image_entries(result: dict) -> list[dict]:
     output = result.get("output", {})
 
-    if isinstance(output, dict):
-        images = output.get("images", [])
-        if isinstance(images, list) and images:
-            extracted = []
-            for item in images:
-                if isinstance(item, dict) and "image" in item:
-                    extracted.append(item["image"])
-                elif isinstance(item, str):
-                    extracted.append(item)
-            return extracted
+    if not isinstance(output, dict):
+        return []
 
-    return []
+    images = output.get("images", [])
+    if not isinstance(images, list):
+        return []
+
+    extracted = []
+    for item in images:
+        if isinstance(item, dict):
+            extracted.append(item)
+        elif isinstance(item, str):
+            extracted.append({"data": item})
+
+    return extracted
 
 
-def save_result_images(result: dict, prompt: str, output_dir: Path, job_id: str) -> list[Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def save_result_images(result: dict, prompt: str, job_id: str) -> list[str]:
+    ensure_dirs()
 
-    images = extract_images(result)
-    if not images:
+    image_entries = extract_image_entries(result)
+    if not image_entries:
         raise RuntimeError(
             f"No images found in completed result for job {job_id}: {json.dumps(result, indent=2)}"
         )
@@ -139,44 +164,64 @@ def save_result_images(result: dict, prompt: str, output_dir: Path, job_id: str)
     prompt_stub = sanitize_filename(prompt)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for index, image_b64 in enumerate(images, start=1):
-        output_path = output_dir / f"{timestamp}_{prompt_stub}_{job_id}_{index}.png"
-        save_base64_image(image_b64, output_path)
-        saved_files.append(output_path)
+    for index, item in enumerate(image_entries, start=1):
+        output_path = OUTPUT_DIR / f"{timestamp}_{prompt_stub}_{job_id}_{index}.png"
+
+        image_b64 = item.get("data") or item.get("image")
+        if image_b64:
+            save_base64_image(image_b64, output_path)
+            saved_files.append(str(output_path))
+        else:
+            log(f"Image entry has no base64 payload for job {job_id}: {json.dumps(item)}")
 
     return saved_files
 
 
 def process_prompt(prompt: str, workflow_template: dict) -> dict:
-    payload = set_prompt(workflow_template, prompt)
+    try:
+        payload = set_prompt(workflow_template, prompt)
 
-    job_id = submit_job(payload)
-    log(f"Submitted job {job_id} for prompt: {prompt}")
+        job_id = submit_job(payload, prompt)
+        log(f"Submitted job {job_id} for prompt: {prompt}")
 
-    result = wait_for_completion(job_id)
-    status = result.get("status", "UNKNOWN")
+        result = wait_for_completion(job_id, prompt)
+        status = result.get("status", "UNKNOWN")
 
-    if status != "COMPLETED":
+        if status != "COMPLETED":
+            return {
+                "prompt": prompt,
+                "job_id": job_id,
+                "status": status,
+                "saved_files": [],
+                "result": result,
+                "error_message": f"Job ended with status {status}",
+            }
+
+        saved_files = save_result_images(result, prompt, job_id)
+
         return {
             "prompt": prompt,
             "job_id": job_id,
             "status": status,
-            "error": result,
-            "saved_files": [],
+            "saved_files": saved_files,
+            "result": result,
+            "error_message": None,
         }
 
-    saved_files = save_result_images(result, prompt, Path(OUTPUT_DIR), job_id)
-
-    return {
-        "prompt": prompt,
-        "job_id": job_id,
-        "status": status,
-        "error": None,
-        "saved_files": [str(path) for path in saved_files],
-    }
+    except Exception as exc:
+        return {
+            "prompt": prompt,
+            "job_id": None,
+            "status": "SCRIPT_ERROR",
+            "saved_files": [],
+            "result": None,
+            "error_message": str(exc),
+        }
 
 
 def main() -> None:
+    ensure_dirs()
+
     workflow_template = load_json(WORKFLOW_TEMPLATE_FILE)
     prompts = load_prompts(INPUT_LIST_FILE)
 
@@ -201,24 +246,25 @@ def main() -> None:
 
         for future in concurrent.futures.as_completed(future_map):
             prompt = future_map[future]
-            try:
-                result = future.result()
-                results.append(result)
+            result = future.result()
+            results.append(result)
 
-                if result["status"] == "COMPLETED":
-                    log(f"Completed: {prompt}")
+            if result["status"] == "COMPLETED":
+                log(f"Completed: {prompt}")
+                if result["saved_files"]:
                     for file_path in result["saved_files"]:
                         log(f"Saved: {file_path}")
                 else:
-                    log(f"Failed: {prompt}")
-                    log(json.dumps(result["error"], indent=2))
+                    log(f"No PNG files saved for prompt: {prompt}")
+                    log("Check outputs/debug/ for the raw final response.")
+            else:
+                log(f"Failed: {prompt}")
+                log(f"Error: {result['error_message']}")
+                if result["result"] is not None:
+                    log("Raw result saved in outputs/debug/")
 
-            except Exception as exc:
-                log(f"Unhandled error for prompt '{prompt}': {exc}")
-
-    summary_path = Path(OUTPUT_DIR) / "summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    summary_path = OUTPUT_DIR / "summary.json"
+    summary_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"Summary saved to: {summary_path}")
 
 
