@@ -67,4 +67,8 @@ Rotate your API key if it was ever exposed.
 ## Run
 ```text
 python main.py
+
+or
+
+python3 main.py
 ```
