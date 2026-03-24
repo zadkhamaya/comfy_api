@@ -60,9 +60,10 @@ RUNPOD_API_KEY=your_runpod_api_key
 RUNPOD_ENDPOINT_ID=your_endpoint_id
 ```
 ### Important
+```text
 Do not commit .env.
 Rotate your API key if it was ever exposed.
-
+```
 ## Run
 ```text
 python main.py
